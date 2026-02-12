@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import torch
 import torch.utils.data as tud
@@ -124,6 +125,9 @@ def create_directed_temporal_graph(
     n1 = nodes1d.loc[(nodes1d.timestep >= start_idx) & (nodes1d.timestep <= end_idx), :]
     n2 = nodes2d.loc[(nodes2d.timestep >= start_idx) & (nodes2d.timestep <= end_idx), :]
 
+    pred_mask_1d = torch.tensor(n1["timestep"].values == n1["timestep"].max(), dtype=torch.bool)
+    pred_mask_2d = torch.tensor(n2["timestep"].values == n2["timestep"].max(), dtype=torch.bool)
+
     x1 = torch.tensor(n1.loc[:, node1d_cols].values, dtype=torch.float32)
     x2 = torch.tensor(n2.loc[:, node2d_cols].values, dtype=torch.float32)
 
@@ -133,9 +137,11 @@ def create_directed_temporal_graph(
 
     data["oneD"].x = x1
     data["oneD"].num_nodes = x1.size(0)
+    data["oneD"].pred_mask = pred_mask_1d
 
     data["twoD"].x = x2
     data["twoD"].num_nodes = x2.size(0)
+    data["twoD"].pred_mask = pred_mask_2d
 
     nnodes1d = len(nodes1d.node_idx.unique())
     nnodes2d = len(nodes2d.node_idx.unique())
@@ -343,4 +349,20 @@ for f in event_dirs[:10]:
     )
 
 dataset_all = ChainDataset(datasets)
-dl = DataLoader(dataset_all, batch_size=8, shuffle=False, drop_last=True)
+DL_NUM_WORKERS = min(2, os.cpu_count() or 0)
+DL_PIN_MEMORY = False
+DL_PREFETCH = 1
+DL_PERSISTENT = DL_NUM_WORKERS > 0
+
+dl_kwargs = {
+    "batch_size": 8,
+    "shuffle": False,
+    "drop_last": True,
+    "num_workers": DL_NUM_WORKERS,
+    "pin_memory": DL_PIN_MEMORY,
+    "persistent_workers": DL_PERSISTENT,
+}
+if DL_NUM_WORKERS > 0:
+    dl_kwargs["prefetch_factor"] = DL_PREFETCH
+
+dl = DataLoader(dataset_all, **dl_kwargs)

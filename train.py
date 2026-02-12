@@ -1,5 +1,4 @@
 import torch
-import matplotlib.pyplot as plt
 
 device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
@@ -21,8 +20,15 @@ def train(model, dataloader, printevery=50):
 
         out = model(data.x_dict, data.edge_index_dict, edge_attr_dict)
 
-        pred_oneDnodes_idxs = data["oneD"].x[:,0] == data["oneD"].x[:,0].max()
-        pred_twoDnodes_idxs = data["twoD"].x[:,0] == data["twoD"].x[:,0].max()
+        if "pred_mask" in data["oneD"]:
+            pred_oneDnodes_idxs = data["oneD"].pred_mask
+        else:
+            pred_oneDnodes_idxs = data["oneD"].x[:, 0] == data["oneD"].x[:, 0].max()
+
+        if "pred_mask" in data["twoD"]:
+            pred_twoDnodes_idxs = data["twoD"].pred_mask
+        else:
+            pred_twoDnodes_idxs = data["twoD"].x[:, 0] == data["twoD"].x[:, 0].max()
 
         oneDpreds = out["oneD"][pred_oneDnodes_idxs].squeeze(-1)
         oneDtruth = data["oneD"].x[pred_oneDnodes_idxs, 2]
