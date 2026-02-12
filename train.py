@@ -10,7 +10,7 @@ def train(model, dataloader, device=None, use_autocast=True, printevery=50):
     if device is None:
         device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
     running_se_real = 0.0
     running_n = 0
@@ -35,11 +35,19 @@ def train(model, dataloader, device=None, use_autocast=True, printevery=50):
         data = data.to(device)
         optimizer.zero_grad()
 
+        # Extract num_timesteps from batch (stored on node types to survive batching)
+        if "num_timesteps" in data["oneD"]:
+            num_timesteps = int(data["oneD"].num_timesteps.item())
+        elif "num_timesteps" in data["twoD"]:
+            num_timesteps = int(data["twoD"].num_timesteps.item())
+        else:
+            num_timesteps = None
+
         edge_attr_dict = build_edge_attr_dict(data, model.edge_dim_std)
 
         if autocast_enabled:
             with torch.autocast(device_type="mps", dtype=torch.float16):
-                out = model(data.x_dict, data.edge_index_dict, edge_attr_dict)
+                out = model(data.x_dict, data.edge_index_dict, edge_attr_dict, num_timesteps=num_timesteps, batch=data)
 
                 if "pred_mask" in data["oneD"]:
                     pred_oneDnodes_idxs = data["oneD"].pred_mask
@@ -66,7 +74,7 @@ def train(model, dataloader, device=None, use_autocast=True, printevery=50):
 
                 loss = (loss1 * n1 + loss2 * n2) / denom
         else:
-            out = model(data.x_dict, data.edge_index_dict, edge_attr_dict)
+            out = model(data.x_dict, data.edge_index_dict, edge_attr_dict, num_timesteps=num_timesteps, batch=data)
 
             if "pred_mask" in data["oneD"]:
                 pred_oneDnodes_idxs = data["oneD"].pred_mask

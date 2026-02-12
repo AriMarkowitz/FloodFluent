@@ -139,10 +139,16 @@ def create_directed_temporal_graph(
     data["oneD"].x = x1
     data["oneD"].num_nodes = x1.size(0)
     data["oneD"].pred_mask = pred_mask_1d
+    # Store base_area for flux computation (static, same across timesteps)
+    base_areas = torch.tensor(n1["base_area"].values, dtype=torch.float32)
+    data["oneD"].base_area = base_areas.repeat(nnodes1d)  # [num_nodes_in_batch]
 
     data["twoD"].x = x2
     data["twoD"].num_nodes = x2.size(0)
     data["twoD"].pred_mask = pred_mask_2d
+    # Store cell_area for flux computation (static, same across timesteps)
+    cell_areas = torch.tensor(n2["area"].values, dtype=torch.float32)
+    data["twoD"].cell_area = cell_areas.repeat(nnodes2d)  # [num_nodes_in_batch]
 
     nnodes1d = len(nodes1d.node_idx.unique())
     nnodes2d = len(nodes2d.node_idx.unique())
@@ -167,6 +173,10 @@ def create_directed_temporal_graph(
     data["twoD", "twoDedge", "twoD"].edge_attr = e2
 
     data["twoD", "twoDoneD", "oneD"].edge_index = idx_builder_cross_node(timesteps, edges1d2d, nnodes1d, nnodes2d)
+
+    # Store num_timesteps on node types so it survives batching
+    data["oneD"].num_timesteps = torch.tensor(timesteps, dtype=torch.long)
+    data["twoD"].num_timesteps = torch.tensor(timesteps, dtype=torch.long)
 
     data.validate()
     return data
@@ -270,8 +280,15 @@ def zscore_edge_df_inplace(df: pd.DataFrame, id_col: str):
     df.loc[:, feat_cols] = ((x - mu) / sigma).numpy()
     return feat_cols
 
+# Extract and normalize edge feature columns
 edge1_cols = zscore_edge_df_inplace(edges1dfeats, EDGE_ID_COL)
 edge2_cols = zscore_edge_df_inplace(edges2dfeats, EDGE_ID_COL)
+
+# Store edge column info globally for model access
+edge_col_info = {
+    'edge1_cols': edge1_cols,
+    'edge2_cols': edge2_cols,
+}
 
 event_dirs = sorted(
     glob.glob(base_path + "/train/event_*"),
