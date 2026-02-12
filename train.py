@@ -1,5 +1,6 @@
 import torch
 import time
+from pathlib import Path
 
 from data import norm_stats, oneD_water_col, twoD_water_col, unnormalize_col
 from model import build_edge_attr_dict
@@ -158,8 +159,8 @@ def train(model, dataloader, device=None, use_autocast=True, printevery=50):
     return epoch_rmse_real
 
 
-def train_full(model, dataloader, epochs=2, device=None, use_autocast=True, printevery=50):
-    """Run full training loop over multiple epochs."""
+def train_full(model, dataloader, epochs=2, device=None, use_autocast=True, printevery=50, checkpoint_dir="./checkpoints"):
+    """Run full training loop over multiple epochs with checkpointing."""
     if device is None:
         device = torch.device("mps" if torch.mps.is_available() else "cpu")
 
@@ -168,6 +169,11 @@ def train_full(model, dataloader, epochs=2, device=None, use_autocast=True, prin
 
     score_train = []
     total_start = time.time()
+
+    # Create checkpoint directory
+    ckpt_path = Path(checkpoint_dir)
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoints will be saved to {ckpt_path.resolve()}")
 
     for epoch in range(epochs):
         print(f"\nRunning Epoch: {epoch}")
@@ -181,7 +187,18 @@ def train_full(model, dataloader, epochs=2, device=None, use_autocast=True, prin
         score_train.append(train_rmse)
         print(f"Epoch: {epoch:03d}, Train RMSE_real: {train_rmse:.4f}")
 
+        # Save checkpoint after epoch
+        ckpt_file = ckpt_path / f"epoch_{epoch:03d}_rmse_{train_rmse:.4f}.pt"
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "rmse": train_rmse,
+        }
+        torch.save(checkpoint, ckpt_file)
+        print(f"  Checkpoint saved: {ckpt_file.name}")
+
     model.eval()
     total_time = time.time() - total_start
     print(f"\nTotal training time: {total_time:.1f}s for {epochs} epochs")
+    print(f"Best RMSE: {min(score_train):.4f}")
     return model, score_train
