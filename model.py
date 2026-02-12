@@ -201,6 +201,8 @@ def build_model_from_batch(batch0, out_dim):
 
     return model
 
-batch0 = next(iter(dl))
+if __name__ == "__main__":
+    from data import dl
 
-model = build_model_from_batch(batch0, 1)
+    batch0 = next(iter(dl))
+    model = build_model_from_batch(batch0, 1)

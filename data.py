@@ -7,6 +7,7 @@ from torch_geometric.loader import DataLoader
 import torch_geometric as tg
 import glob
 from pathlib import Path
+import hashlib
 
 # =========================
 # Running stats (Welford)
@@ -179,6 +180,8 @@ class TemporalGraphStream(IterableDataset):
         edges1dfeats, edges2dfeats,
         node1d_cols, node2d_cols, edge1_cols, edge2_cols,
         norm_stats,
+        cache_dir=None,
+        event_id=None,
     ):
         super().__init__()
         self.idxs = idxs
@@ -194,18 +197,40 @@ class TemporalGraphStream(IterableDataset):
         self.edge1_cols = edge1_cols
         self.edge2_cols = edge2_cols
         self.norm_stats = norm_stats
+        self.cache_dir = cache_dir
+        self.event_id = event_id
+
+    def _get_cache_path(self, idx_pair):
+        """Generate deterministic cache file for a window."""
+        if self.cache_dir is None:
+            return None
+        start, end = idx_pair
+        key = f"event_{self.event_id}_window_{start}_{end}"
+        h = hashlib.md5(key.encode()).hexdigest()[:8]
+        return Path(self.cache_dir) / f"{key}_{h}.pt"
 
     def __iter__(self):
-        for start_idx, end_idx in self.idxs:
-            yield create_directed_temporal_graph(
-                start_idx, end_idx,
-                self.nodes1d, self.nodes2d,
-                self.edges1d, self.edges2d, self.edges1d2d,
-                self.edges1dfeats, self.edges2dfeats,
-                self.node1d_cols, self.node2d_cols,
-                self.edge1_cols, self.edge2_cols,
-                norm_stats=self.norm_stats
-            )
+        for idx_pair in self.idxs:
+            cache_path = self._get_cache_path(idx_pair)
+
+            if cache_path and cache_path.exists():
+                data = torch.load(cache_path, weights_only=False)
+            else:
+                start_idx, end_idx = idx_pair
+                data = create_directed_temporal_graph(
+                    start_idx, end_idx,
+                    self.nodes1d, self.nodes2d,
+                    self.edges1d, self.edges2d, self.edges1d2d,
+                    self.edges1dfeats, self.edges2dfeats,
+                    self.node1d_cols, self.node2d_cols,
+                    self.edge1_cols, self.edge2_cols,
+                    norm_stats=self.norm_stats
+                )
+                if cache_path:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(data, cache_path)
+
+            yield data
 
 
 # =========================
@@ -324,8 +349,10 @@ twoD_rain_col  = node2d_cols.index("rainfall") if "rainfall" in node2d_cols else
 # PASS 2: build datasets (no caching of all events)
 # =========================
 
+cache_dir = Path.home() / ".cache" / "flood_graphs"
+
 datasets = []
-for f in event_dirs[:10]:
+for event_idx, f in enumerate(event_dirs[:10]):
     nodes1d = pd.read_csv(f + "/1d_nodes_dynamic_all.csv")
     nodes2d = pd.read_csv(f + "/2d_nodes_dynamic_all.csv")
 
@@ -344,14 +371,26 @@ for f in event_dirs[:10]:
             edges1d, edges2d, edges1d2d,
             edges1dfeats, edges2dfeats,
             node1d_cols, node2d_cols, edge1_cols, edge2_cols,
-            norm_stats
+            norm_stats,
+            cache_dir=str(cache_dir),
+            event_id=event_idx,
         )
     )
 
 dataset_all = ChainDataset(datasets)
-DL_NUM_WORKERS = min(2, os.cpu_count() or 0)
+def _running_in_notebook():
+    try:
+        from IPython import get_ipython
+
+        shell = get_ipython()
+        return shell is not None and shell.__class__.__name__ == "ZMQInteractiveShell"
+    except Exception:
+        return False
+
+
+DL_NUM_WORKERS = 0 if _running_in_notebook() else min(4, os.cpu_count() or 0)
 DL_PIN_MEMORY = False
-DL_PREFETCH = 1
+DL_PREFETCH = 2
 DL_PERSISTENT = DL_NUM_WORKERS > 0
 
 dl_kwargs = {

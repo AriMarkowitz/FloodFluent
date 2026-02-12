@@ -1,17 +1,16 @@
-from torch_geometric.nn.conv import GATv2Conv
-from torch_geometric.nn import to_hetero
 import torch
 
-class GNN(torch.nn.Module):
-    def __init__(self, hidden_channels, out_channels):
-        super().__init__()
-        self.conv1 = GATv2Conv((-1,-1), hidden_channels, add_self_loops=False)
-        self.conv2 = GATv2Conv((-1,-1), out_channels,add_self_loops=False)
+from data import dl
+from model import build_model_from_batch
+from train import train_full
 
-    def forward(self, x, edge_idx):
-        x = torch.relu(self.conv1(x, edge_idx))
-        x = self.conv2(x, edge_idx)
-        return x
 
-model1 = GNN(hidden_channels=64, out_channels=1)
-model1 = to_hetero(model1, metadata, aggr="sum")
+def main():
+    device = torch.device("mps" if torch.mps.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    batch0 = next(iter(dl))
+    model = build_model_from_batch(batch0, 1)
+
+    model, scores = train_full(model, dl, epochs=2, device=device, use_autocast=True, printevery =5)
+    print(f"\nTraining complete. Final RMSE: {scores[-1]:.4f}")
