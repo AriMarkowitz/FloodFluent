@@ -14,3 +14,8 @@ def main():
 
     model, scores = train_full(model, dl, epochs=2, device=device, use_autocast=True, printevery =5)
     print(f"\nTraining complete. Final RMSE: {scores[-1]:.4f}")
+
+
+if __name__ == "__main__":
+    main()
+
