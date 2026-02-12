@@ -67,11 +67,14 @@ class FluxLayer(nn.Module):
         length = edge_attr[:, self.length_idx:self.length_idx+1]  # [num_edges, 1]
         
         # Optionally include area effect on flux magnitude
-        if node_areas is not None:
-            src_area = node_areas[src:src+1]  # [num_edges, 1]
-            dst_area = node_areas[dst:dst+1]  # [num_edges, 1]
-            # Use harmonic mean of areas (bottleneck effect)
-            avg_area = 2 * src_area * dst_area / (src_area + dst_area + 1e-8)  # [num_edges, 1]
+        if self.use_area:
+            if node_areas is None:
+                avg_area = torch.zeros_like(h_diff)
+            else:
+                src_area = node_areas[src].unsqueeze(1)  # [num_edges, 1]
+                dst_area = node_areas[dst].unsqueeze(1)  # [num_edges, 1]
+                # Use harmonic mean of areas (bottleneck effect)
+                avg_area = 2 * src_area * dst_area / (src_area + dst_area + 1e-8)  # [num_edges, 1]
             flux_input = torch.cat([h_diff, slope, length, avg_area], dim=1)  # [num_edges, 4]
         else:
             flux_input = torch.cat([h_diff, slope, length], dim=1)  # [num_edges, 3]

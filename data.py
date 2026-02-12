@@ -6,6 +6,7 @@ from torch.utils.data import IterableDataset, ChainDataset
 from torch_geometric.loader import DataLoader
 import torch_geometric as tg
 import glob
+import random
 from pathlib import Path
 import hashlib
 
@@ -139,16 +140,16 @@ def create_directed_temporal_graph(
     data["oneD"].x = x1
     data["oneD"].num_nodes = x1.size(0)
     data["oneD"].pred_mask = pred_mask_1d
-    # Store base_area for flux computation (static, same across timesteps)
+    # Store base_area for flux computation (aligned with node rows)
     base_areas = torch.tensor(n1["base_area"].values, dtype=torch.float32)
-    data["oneD"].base_area = base_areas.repeat(nnodes1d)  # [num_nodes_in_batch]
+    data["oneD"].base_area = base_areas  # [num_nodes_in_batch]
 
     data["twoD"].x = x2
     data["twoD"].num_nodes = x2.size(0)
     data["twoD"].pred_mask = pred_mask_2d
-    # Store cell_area for flux computation (static, same across timesteps)
+    # Store cell_area for flux computation (aligned with node rows)
     cell_areas = torch.tensor(n2["area"].values, dtype=torch.float32)
-    data["twoD"].cell_area = cell_areas.repeat(nnodes2d)  # [num_nodes_in_batch]
+    data["twoD"].cell_area = cell_areas  # [num_nodes_in_batch]
 
     nnodes1d = len(nodes1d.node_idx.unique())
     nnodes2d = len(nodes2d.node_idx.unique())
@@ -192,6 +193,7 @@ class TemporalGraphStream(IterableDataset):
         norm_stats,
         cache_dir=None,
         event_id=None,
+        shuffle=False,
     ):
         super().__init__()
         self.idxs = idxs
@@ -209,6 +211,7 @@ class TemporalGraphStream(IterableDataset):
         self.norm_stats = norm_stats
         self.cache_dir = cache_dir
         self.event_id = event_id
+        self.shuffle = shuffle
 
     def _get_cache_path(self, idx_pair):
         """Generate deterministic cache file for a window."""
@@ -220,7 +223,10 @@ class TemporalGraphStream(IterableDataset):
         return Path(self.cache_dir) / f"{key}_{h}.pt"
 
     def __iter__(self):
-        for idx_pair in self.idxs:
+        idxs = list(self.idxs)
+        if self.shuffle:
+            random.shuffle(idxs)
+        for idx_pair in idxs:
             cache_path = self._get_cache_path(idx_pair)
 
             if cache_path and cache_path.exists():
@@ -391,6 +397,7 @@ for event_idx, f in enumerate(event_dirs[:10]):
             norm_stats,
             cache_dir=str(cache_dir),
             event_id=event_idx,
+            shuffle=True,
         )
     )
 
