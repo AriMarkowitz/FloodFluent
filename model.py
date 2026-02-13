@@ -2,149 +2,189 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.nn as pyg_nn
+import torch_geometric.utils as pyg_utils
 
 
 # ---------------------------------------------------------
-# Flux Computation (physics-aware message passing)
+# Mass Conservation Update (physics-grounded state update)
 # ---------------------------------------------------------
 
-class FluxLayer(nn.Module):
+class MassConservationUpdate(nn.Module):
     """
-    Computes water flux between nodes based on topography.
-    Flux = f(water_level_diff, slope, length, [optional: area])
-    
-    Physical constraints on flux:
-    - 'none': allow any flux (positive or negative)
-    - 'non_negative': clamp flux >= 0 (only forward flow, no backflow)
-    - 'soft_penalty': allow negative but encourage non-negative via regularization
-    
-    Args:
-        hidden: hidden dimension
-        slope_idx: column index in edge_attr for slope
-        length_idx: column index in edge_attr for length
-        use_area: whether to include area in flux computation
-        flux_scale: scaling factor for flux output
-        flux_constraint: 'none', 'non_negative', or 'soft_penalty'
+    Mass-conservation style state update on a time-unrolled graph with edges t -> t+1.
+
+    Assumptions (match your construction):
+      - Node indices are ordered by time blocks.
+      - For a given node type, nodes_per_timestep = num_nodes_total // T is constant.
+      - For nodes at timestep t+1, the previous state node index is prev = idx - nodes_per_timestep.
+
+    The update uses:
+      - inflow at dst: sum(flux_e) over edges ending at dst
+      - outflow at prev: sum(flux_e) over edges starting at prev
+      - next_state = prev_state + dt/area * (inflow(dst) - outflow(prev)) + dt * rainfall(prev)
+
+    flux_e is learned but constrained non-negative.
     """
-    def __init__(self, hidden=128, slope_idx=None, length_idx=None, use_area=True, flux_scale=1.0, flux_constraint='none'):
+
+    def __init__(
+        self,
+        wl_idx: int,
+        edge_slope_idx: int | None,
+        edge_length_idx: int | None,
+        rain_idx: int | None = None,
+        dt: float = 1.0,
+        use_learned_flux: bool = True,
+        hidden_flux: int = 32,
+        clamp_nonneg_flux: bool = True,
+        eps: float = 1e-8,
+    ):
         super().__init__()
-        self.slope_idx = slope_idx if slope_idx is not None else 0
-        self.length_idx = length_idx if length_idx is not None else 1
-        self.use_area = use_area
-        self.flux_scale = flux_scale
-        self.flux_constraint = flux_constraint
-        
-        # Learn flux from: [water_level_diff, slope, length] or [water_level_diff, slope, length, area]
-        input_dim = 4 if use_area else 3
-        self.flux_mlp = nn.Sequential(
-            nn.Linear(input_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-        
-    def forward(self, x, edge_index, edge_attr, node_areas=None):
-        """
-        Compute flux for each edge.
-        
-        x: [num_nodes, hidden] - node features
-        edge_index: [2, num_edges]
-        edge_attr: [num_edges, edge_dim] - contains slope and length at specified indices
-        node_areas: [num_nodes] - node areas/cross-sections (optional)
-        
-        Returns: [num_edges, 1] - flux magnitude
-        """
-        src, dst = edge_index[0], edge_index[1]
-        
-        # Extract node water levels (use mean across all features)
-        x_src = x[src]  # [num_edges, hidden]
-        x_dst = x[dst]  # [num_edges, hidden]
-        
-        # Water level difference drives flux
-        h_diff = (x_src - x_dst).mean(dim=1, keepdim=True)  # [num_edges, 1]
-        
-        # Extract slope and length from edge attributes
-        slope = edge_attr[:, self.slope_idx:self.slope_idx+1]  # [num_edges, 1]
-        length = edge_attr[:, self.length_idx:self.length_idx+1]  # [num_edges, 1]
-        
-        # Optionally include area effect on flux magnitude
-        if self.use_area:
-            if node_areas is None:
-                avg_area = torch.zeros_like(h_diff)
-            else:
-                src_area = node_areas[src].unsqueeze(1)  # [num_edges, 1]
-                dst_area = node_areas[dst].unsqueeze(1)  # [num_edges, 1]
-                # Use harmonic mean of areas (bottleneck effect)
-                avg_area = 2 * src_area * dst_area / (src_area + dst_area + 1e-8)  # [num_edges, 1]
-            flux_input = torch.cat([h_diff, slope, length, avg_area], dim=1)  # [num_edges, 4]
+        self.wl_idx = wl_idx
+        self.rain_idx = rain_idx
+        self.edge_slope_idx = edge_slope_idx
+        self.edge_length_idx = edge_length_idx
+        self.dt = float(dt)
+        self.use_learned_flux = bool(use_learned_flux)
+        self.clamp_nonneg_flux = bool(clamp_nonneg_flux)
+        self.eps = float(eps)
+
+        # Flux model f([wl_src, wl_prev_dst, slope, inv_length]) -> flux >= 0
+        in_dim = 2  # wl_src, wl_prev_dst
+        if edge_slope_idx is not None:
+            in_dim += 1
+        if edge_length_idx is not None:
+            in_dim += 1  # we'll feed inv_length
+
+        if self.use_learned_flux:
+            self.flux_mlp = nn.Sequential(
+                nn.Linear(in_dim, hidden_flux),
+                nn.ReLU(),
+                nn.Linear(hidden_flux, 1),
+            )
         else:
-            flux_input = torch.cat([h_diff, slope, length], dim=1)  # [num_edges, 3]
+            self.flux_mlp = None
+
+    def _compute_flux(self, wl_src, wl_prev_dst, edge_attr):
+        """Compute non-negative flux from source to destination."""
+        # wl_src, wl_prev_dst: [E, 1]
+        feats = [wl_src, wl_prev_dst]
+
+        if self.edge_slope_idx is not None:
+            slope = edge_attr[:, self.edge_slope_idx:self.edge_slope_idx+1]
+            feats.append(slope)
+
+        if self.edge_length_idx is not None:
+            length = edge_attr[:, self.edge_length_idx:self.edge_length_idx+1].clamp_min(self.eps)
+            inv_len = 1.0 / length
+            feats.append(inv_len)
+
+        z = torch.cat(feats, dim=1)  # [E, in_dim]
+
+        if self.flux_mlp is not None:
+            q = self.flux_mlp(z)  # [E, 1]
+        else:
+            # Simple physically-motivated baseline
+            # q ~ relu(wl_src - wl_prev_dst) * relu(slope) * inv_length
+            q = F.relu(wl_src - wl_prev_dst)
+            if self.edge_slope_idx is not None:
+                q = q * F.relu(edge_attr[:, self.edge_slope_idx:self.edge_slope_idx+1])
+            if self.edge_length_idx is not None:
+                q = q * (1.0 / edge_attr[:, self.edge_length_idx:self.edge_length_idx+1].clamp_min(self.eps))
+
+        if self.clamp_nonneg_flux:
+            q = F.relu(q)
+
+        return q  # [E, 1]
+
+    def forward(
+        self,
+        x: torch.Tensor,              # [N, F] for one node type (time-unrolled nodes)
+        edge_index: torch.Tensor,     # [2, E] edges t -> t+1
+        edge_attr: torch.Tensor,      # [E, D]
+        num_timesteps: int,           # T for this node type in this graph window
+        node_area: torch.Tensor | None = None,  # [N] or [N,1], aligned with x rows
+    ):
+        src = edge_index[0]
+        dst = edge_index[1]
+
+        # nodes per timestep for this node type
+        N = x.size(0)
+        T = int(num_timesteps)
+        n_per_t = N // T  # assumes constant per time slice
+
+        # prev index for each dst (dst is at t+1)
+        prev = dst.to(torch.long) - n_per_t
+
+        # Identify valid dst (i.e., not the first time block)
+        valid = prev >= 0
+
+        # Pull water levels for flux computation
+        wl_src = x[src, self.wl_idx].unsqueeze(1)  # [E,1]
+
+        # For wl_prev_dst, only valid edges make sense; fill invalid with dst wl
+        wl_prev_dst = torch.zeros_like(wl_src)
+        wl_prev_dst[valid] = x[prev[valid], self.wl_idx].unsqueeze(1)
+        wl_prev_dst[~valid] = x[dst[~valid], self.wl_idx].unsqueeze(1)
+
+        # Compute per-edge flux q_e >= 0
+        q = self._compute_flux(wl_src, wl_prev_dst, edge_attr)  # [E,1]
+
+        # Aggregate inflow to dst
+        inflow_dst = pyg_utils.scatter(q, dst, dim=0, dim_size=N, reduce="sum")  # [N,1]
+
+        # Aggregate outflow from src
+        outflow_src = pyg_utils.scatter(q, src, dim=0, dim_size=N, reduce="sum")  # [N,1]
+
+        # Build prev_state for every node
+        prev_state = x[:, self.wl_idx].clone().unsqueeze(1)  # [N,1]
+        idxs = torch.arange(N, device=x.device)
+        has_prev = idxs >= n_per_t
+        prev_state[has_prev] = x[idxs[has_prev] - n_per_t, self.wl_idx].unsqueeze(1)
+
+        # Area scaling
+        if node_area is None:
+            area = torch.ones((N, 1), device=x.device, dtype=x.dtype)
+        else:
+            area = node_area
+            if area.dim() == 1:
+                area = area.unsqueeze(1)
+            # More aggressive clamping for numerical stability
+            area = area.to(x.dtype).clamp_min(0.1)  # Clamp to minimum 0.1 instead of eps
+
+        # Safety: check for invalid areas
+        if torch.any(torch.isnan(area)):
+            print(f"WARNING: NaN in node_area, using ones")
+            area = torch.ones_like(area)
+        if torch.any(torch.isinf(area)):
+            print(f"WARNING: Inf in node_area, using ones")
+            area = torch.ones_like(area)
+
+        # Outflow for each node should be taken from its prev node
+        outflow_prev = torch.zeros_like(inflow_dst)
+        outflow_prev[has_prev] = outflow_src[idxs[has_prev] - n_per_t]
+
+        net = inflow_dst - outflow_prev  # [N,1]
+
+        # Rainfall source term
+        rain_term = 0.0
+        if self.rain_idx is not None:
+            rain = torch.zeros((N, 1), device=x.device, dtype=x.dtype)
+            rain[has_prev] = x[idxs[has_prev] - n_per_t, self.rain_idx].unsqueeze(1)
+            rain_term = self.dt * rain
+
+        wl_next = prev_state + (self.dt / area) * net + rain_term  # [N,1]
         
-        # Learn flux magnitude
-        flux = self.flux_mlp(flux_input) * self.flux_scale  # [num_edges, 1]
-        
-        # Apply physical constraint
-        if self.flux_constraint == 'non_negative':
-            flux = torch.relu(flux)  # Clamp to >= 0 (no backflow)
-        elif self.flux_constraint == 'soft_penalty':
-            # Allow negative but penalize it (regularization handled in loss)
-            pass
-        # else: 'none' - allow any flux
-        
-        return flux
+        # Guard against NaN/Inf in output
+        if torch.any(torch.isnan(wl_next)):
+            print(f"WARNING: NaN detected in wl_next, replacing with prev_state")
+            wl_next = torch.where(torch.isnan(wl_next), prev_state, wl_next)
+        if torch.any(torch.isinf(wl_next)):
+            print(f"WARNING: Inf detected in wl_next, clamping")
+            wl_next = torch.clamp(wl_next, -1e6, 1e6)
+
+        return wl_next, q
 
 
-# ---------------------------------------------------------
-# Temporal Attention (over timesteps)
-# ---------------------------------------------------------
-
-class TemporalAttention(nn.Module):
-    """
-    Learns to weight the importance of each timestep.
-    Input: [num_timesteps, num_nodes, hidden]
-    Output: [num_nodes, hidden] (weighted temporal aggregation)
-    """
-    def __init__(self, hidden=128, heads=4):
-        super().__init__()
-        self.hidden = hidden
-        self.heads = heads
-        self.head_dim = hidden // heads
-
-        self.to_q = nn.Linear(hidden, hidden)
-        self.to_k = nn.Linear(hidden, hidden)
-        self.to_v = nn.Linear(hidden, hidden)
-        self.to_out = nn.Linear(hidden, hidden)
-        self.scale = self.head_dim ** -0.5
-
-    def forward(self, x_temporal):
-        """
-        x_temporal: [timesteps, num_nodes, hidden]
-        Returns: [num_nodes, hidden]
-        """
-        T, N, H = x_temporal.shape
-
-        # Reshape to [T*N, H] for attention computation
-        x_flat = x_temporal.reshape(T * N, H)
-        
-        # Project and reshape: [T*N, H] -> [T*N, heads*head_dim] -> [T, N, heads, head_dim] -> [heads, N, T, head_dim]
-        q = self.to_q(x_flat).reshape(T, N, self.heads, self.head_dim).permute(2, 1, 0, 3)  # [heads, N, T, head_dim]
-        k = self.to_k(x_flat).reshape(T, N, self.heads, self.head_dim).permute(2, 1, 0, 3)
-        v = self.to_v(x_flat).reshape(T, N, self.heads, self.head_dim).permute(2, 1, 0, 3)
-
-        # Attend over timestep dimension: [heads, N, T, T]
-        attn = torch.einsum("hntd,hmtd->hnmm", q, k) * self.scale
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention: [heads, N, T, head_dim]
-        out = torch.einsum("hnmm,hmtd->hntd", attn, v)
-
-        # Average over timesteps: [heads, N, head_dim]
-        out = out.mean(dim=2)
-
-        # Merge heads and project: [N, H]
-        out = out.transpose(0, 1).reshape(N, H)
-        out = self.to_out(out)
-
-        return out
 
 
 # ---------------------------------------------------------
@@ -152,13 +192,13 @@ class TemporalAttention(nn.Module):
 # ---------------------------------------------------------
 
 class EdgeAwareTransformerBackbone(nn.Module):
-    def __init__(self, hidden=128, heads=4, num_layers=3, dropout=0.3, edge_dim=1):
+    def __init__(self, hidden=128, heads=2, num_layers=3, dropout=0.3, edge_dim=1):
         super().__init__()
 
         self.drop = nn.Dropout(dropout)
+        self.input_norm = nn.LayerNorm(hidden)
 
         self.convs = nn.ModuleList()
-        self.proj  = nn.ModuleList()
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
@@ -167,19 +207,18 @@ class EdgeAwareTransformerBackbone(nn.Module):
                     in_channels=hidden,
                     out_channels=hidden,
                     heads=heads,
-                    concat=True,
+                    concat=False,  # Average heads instead of concat for stable gradients
                     dropout=dropout,
                     edge_dim=edge_dim,
                     bias=True,
                 )
             )
-            self.proj.append(nn.Linear(hidden * heads, hidden))
             self.norms.append(nn.LayerNorm(hidden))
 
-    def forward(self, x, edge_index, edge_attr):
-        for conv, proj, norm in zip(self.convs, self.proj, self.norms):
+    def forward(self, x, edge_index, edge_attr, batch=None):
+        x = self.input_norm(x)
+        for conv, norm in zip(self.convs, self.norms):
             h = conv(x, edge_index, edge_attr)
-            h = proj(h)
             h = F.elu(h)
             h = self.drop(h)
             x = norm(x + h)
@@ -198,21 +237,20 @@ class HeteroEdgeAwareTransformer(nn.Module):
         edge_dim_by_type,
         out_dim,
         hidden=128,
-        heads=4,
+        heads=2,
         num_layers=3,
         dropout=0.3,
         aggr="sum",
-        use_temporal_attention=True,
-        use_flux=False,
+        use_cons_of_mass=False,
         flux_indices=None,
-        flux_constraint='none',
+        norm_stats=None,
     ):
         super().__init__()
 
         self.node_types = list(metadata[0])
         self.edge_types = list(metadata[1])
-        self.use_temporal_attention = use_temporal_attention
-        self.use_flux = use_flux
+        self.use_cons_of_mass = use_cons_of_mass
+        self.norm_stats = norm_stats
 
         # ---- node input projections ----
         self.in_proj = nn.ModuleDict({
@@ -233,24 +271,32 @@ class HeteroEdgeAwareTransformer(nn.Module):
             if edge_dim_by_type[etype] > 0
         })
 
-        # ---- flux computation (per edge type) ----
-        if use_flux:
-            self.flux = nn.ModuleDict()
-            for etype in self.edge_types:
-                etype_str = str(etype)
-                # Get indices for this edge type
-                indices = flux_indices.get(etype_str, {}) if flux_indices else {}
-                slope_idx = indices.get('slope_idx', None)
-                length_idx = indices.get('length_idx', None)
+        # ---- mass conservation updates (per node type) ----
+        if use_cons_of_mass:
+            self.mass_updates = nn.ModuleDict()
+            for ntype in self.node_types:
+                # Find the self-loop edge type for this node type
+                self_edge_str = str((ntype, f"{ntype}edge", ntype))
                 
-                flux_layer = FluxLayer(
-                    hidden=hidden,
-                    slope_idx=slope_idx,
-                    length_idx=length_idx,
-                    flux_scale=1.0,
-                    flux_constraint=flux_constraint,
+                # Get wl_idx from flux_indices
+                wl_idx = flux_indices.get(ntype, {}).get('wl_idx', 0) if flux_indices else 0
+                
+                # Get slope and length indices
+                edge_indices = flux_indices.get(self_edge_str, {}) if flux_indices else {}
+                slope_idx = edge_indices.get('slope_idx')
+                length_idx = edge_indices.get('length_idx')
+                
+                mass_update = MassConservationUpdate(
+                    wl_idx=wl_idx,
+                    edge_slope_idx=slope_idx,
+                    edge_length_idx=length_idx,
+                    rain_idx=None,
+                    dt=1.0,
+                    use_learned_flux=True,
+                    hidden_flux=32,
+                    clamp_nonneg_flux=True,
                 )
-                self.flux[etype_str] = flux_layer
+                self.mass_updates[ntype] = mass_update
 
         # ---- backbone ----
         backbone = EdgeAwareTransformerBackbone(
@@ -262,13 +308,6 @@ class HeteroEdgeAwareTransformer(nn.Module):
         )
 
         self.gnn = pyg_nn.to_hetero(backbone, metadata, aggr=aggr)
-
-        # ---- temporal attention (per node type) ----
-        if use_temporal_attention:
-            self.temporal_attn = nn.ModuleDict({
-                ntype: TemporalAttention(hidden=hidden, heads=heads)
-                for ntype in self.node_types
-            })
 
         # ---- prediction heads (one per node type) ----
         self.heads = nn.ModuleDict({
@@ -286,10 +325,13 @@ class HeteroEdgeAwareTransformer(nn.Module):
     # -----------------------------------------------------
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict, num_timesteps=None, batch=None):
-        # Store original x_dict for area extraction before projection
-        x_dict_orig = x_dict
+        # NOTE: Mass conservation currently disabled. If re-enabled in future, will need to:
+        # 1. Unnormalize x_dict using normalizer.unnormalize() for each feature
+        # 2. Run mass conservation in real (unnormalized) space
+        # 3. Re-normalize output using normalizer.transform_dynamic()
+        # For now, all data is in [0,1] normalized space and model works directly on it.
         
-        # project node features
+        # project node features (on normalized data)
         x_dict = {
             ntype: F.relu(self.in_proj[ntype](x_dict[ntype]))
             for ntype in self.node_types
@@ -306,66 +348,35 @@ class HeteroEdgeAwareTransformer(nn.Module):
 
             out_edge_attr[etype] = ea
 
-        # Compute and apply flux if enabled
-        if self.use_flux and batch is not None:
-            for etype in self.edge_types:
-                src_type, _, dst_type = etype
-                edge_index = edge_index_dict[etype]
-                
-                # Get node areas from batch metadata if available
-                node_areas_src = None
-                if "base_area" in batch[src_type]:
-                    node_areas_src = batch[src_type].base_area
-                elif "cell_area" in batch[src_type]:
-                    node_areas_src = batch[src_type].cell_area
-                
-                # Compute flux for this edge type
-                flux = self.flux[str(etype)](
-                    x_dict[src_type],
-                    edge_index,
-                    edge_attr_dict[etype],
-                    node_areas=node_areas_src
-                )  # [num_edges, 1]
-                
-                # Scale edge attributes by flux magnitude (gating mechanism)
-                flux_gate = torch.sigmoid(flux)  # [num_edges, 1]
-                out_edge_attr[etype] = out_edge_attr[etype] * flux_gate
-        elif self.use_flux:
-            for etype in self.edge_types:
-                edge_index = edge_index_dict[etype]
-                # Compute flux without area information
-                flux = self.flux[str(etype)](
-                    x_dict[etype[0]],
-                    edge_index,
-                    edge_attr_dict[etype],
-                    node_areas=None
-                )
-                flux_gate = torch.sigmoid(flux)
-                out_edge_attr[etype] = out_edge_attr[etype] * flux_gate
+        # If using mass conservation, compute water level updates directly
+        if self.use_cons_of_mass and batch is not None:
+            # NOTE: Mass conservation is currently disabled in main.py
+            # If re-enabled, this code path needs to be updated to work with FeatureNormalizer
+            # instead of the old mu/sigma approach
+            raise NotImplementedError(
+                "Mass conservation mode needs to be updated for FeatureNormalizer. "
+                "Please set use_cons_of_mass=False in main.py or update this code path."
+            )
+        else:
+            # Otherwise, use GNN backbone for predictions
+            # GNN forward pass (x_dict already projected to hidden)
+            batch_dict = None
+            if batch is not None:
+                batch_dict = {
+                    ntype: batch[ntype].batch
+                    for ntype in self.node_types
+                    if hasattr(batch[ntype], "batch")
+                }
 
-        h_dict = self.gnn(x_dict, edge_index_dict, out_edge_attr)
-
-        # Apply temporal attention if enabled and num_timesteps provided
-        if self.use_temporal_attention and num_timesteps is not None:
-            for ntype in self.node_types:
-                h = h_dict[ntype]
-                # Reshape to [timesteps, num_nodes_per_timestep, hidden]
-                num_nodes_per_t = h.size(0) // num_timesteps
-                h_temporal = h.reshape(num_timesteps, num_nodes_per_t, -1)
-                
-                # Apply temporal attention
-                h_attn = self.temporal_attn[ntype](h_temporal)
-                
-                # Replicate across timesteps so we can still use per-timestep masks if needed
-                h_dict[ntype] = h_attn.repeat(num_timesteps, 1)
-
-        # return predictions for every node type
-        return {
-            ntype: self.heads[ntype](h_dict[ntype])
-            for ntype in self.node_types
-        }
-
-
+            if batch_dict:
+                out_x = self.gnn(x_dict, edge_index_dict, out_edge_attr, batch_dict)
+            else:
+                out_x = self.gnn(x_dict, edge_index_dict, out_edge_attr)
+            
+            # Prediction heads
+            out = {ntype: self.heads[ntype](out_x[ntype]) for ntype in self.node_types}
+            
+            return out
 # ---------------------------------------------------------
 # Helper: build edge_attr_dict safely per batch
 # ---------------------------------------------------------
@@ -416,7 +427,7 @@ def _get_feature_indices(col_names, feature_name):
         return None
 
 
-def build_model_from_batch(batch0, out_dim, edge_col_info=None, use_flux=True, use_temporal_attention=True, flux_constraint='none'):
+def build_model_from_batch(batch0, out_dim, edge_col_info=None, water_level_indices=None, use_cons_of_mass=False, norm_stats=None):
     """
     Build model from batch.
     
@@ -424,9 +435,8 @@ def build_model_from_batch(batch0, out_dim, edge_col_info=None, use_flux=True, u
         batch0: first batch from dataloader
         out_dim: output dimension
         edge_col_info: dict with 'edge1_cols' and 'edge2_cols' lists (actual column names)
-        use_flux: whether to use flux-based message passing
-        use_temporal_attention: whether to use temporal attention
-        flux_constraint: 'none', 'non_negative', or 'soft_penalty' - physics constraint on flux
+        water_level_indices: dict with 'oneD' and 'twoD' keys mapping to wl column indices
+        use_cons_of_mass: whether to use mass-conservation-based water level updates
     """
     in_dims_by_type = {
         ntype: batch0[ntype].x.size(-1)
@@ -442,7 +452,7 @@ def build_model_from_batch(batch0, out_dim, edge_col_info=None, use_flux=True, u
 
     # Compute feature indices if column info provided
     flux_indices = {}
-    if use_flux and edge_col_info:
+    if use_cons_of_mass and edge_col_info:
         edge1_cols = edge_col_info.get('edge1_cols', [])
         edge2_cols = edge_col_info.get('edge2_cols', [])
         
@@ -460,16 +470,24 @@ def build_model_from_batch(batch0, out_dim, edge_col_info=None, use_flux=True, u
                 'length_idx': _get_feature_indices(edge2_cols, 'length'),
             },
         }
+        
+        # Store water level indices for mass conservation
+        if water_level_indices is None:
+            water_level_indices = {'oneD': 0, 'twoD': 0}  # fallback defaults
+        
+        # Update flux_indices with wl_idx for each node type
+        for ntype in ['oneD', 'twoD']:
+            wl_idx = water_level_indices.get(ntype, 0)
+            flux_indices[ntype] = {'wl_idx': wl_idx}
 
     model = HeteroEdgeAwareTransformer(
         metadata=batch0.metadata(),
         in_dims_by_type=in_dims_by_type,
         edge_dim_by_type=edge_dim_by_type,
         out_dim=out_dim,
-        use_flux=use_flux,
-        use_temporal_attention=use_temporal_attention,
+        use_cons_of_mass=use_cons_of_mass,
         flux_indices=flux_indices,
-        flux_constraint=flux_constraint,
+        norm_stats=norm_stats,
     )
 
     return model
